@@ -63,19 +63,20 @@ def init_db():
             views INTEGER NOT NULL, old_views INTEGER NOT NULL DEFAULT 0,
             first_seen TEXT NOT NULL, checked TEXT NOT NULL,
             created TEXT NOT NULL, duration REAL NOT NULL DEFAULT 0,
-            score INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'new',
+            score INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'ready',
             note TEXT NOT NULL DEFAULT ''
         )""")
         db.execute("""CREATE TABLE IF NOT EXISTS posts (
             clip_id TEXT NOT NULL, platform TEXT NOT NULL, url TEXT NOT NULL,
             PRIMARY KEY (clip_id,platform)
         )""")
+        db.execute("UPDATE clips SET status='ready' WHERE status IN ('new', 'approved')")
         db.commit()
 
 def rights():
     raw = os.environ.get("CREATOR_PERMISSION_JSON", "")
     if not raw:
-        raise ValueError("Add documented Greekgodx permission before approving clips.")
+        raise ValueError("Add documented Greekgodx permission before recording external posts.")
     try:
         obj = json.loads(raw)
         valid = (obj.get("creator_login", "").lower() == "greekgodx"
@@ -170,7 +171,7 @@ def do_scan():
                         (clip["id"], values[0], values[1], views, 0, now.isoformat(),
                          now.isoformat(), created_text, duration, score))
             db.commit()
-        SCAN["message"] = f"Checked {len(clips)} Greekgodx clips."
+        SCAN["message"] = f"Checked {len(clips)} Greekgodx clips. New clips are automatically queued."
     except Exception as exc:
         logger.exception("Scan failed")
         SCAN["message"] = f"Scan unavailable: {str(exc)[:180]}"
@@ -220,7 +221,7 @@ def page(content):
     button,input{font:inherit;border-radius:7px;padding:8px;background:#273c54;color:white;border:1px solid #576e86}
     button{cursor:pointer}form{display:inline-block;margin:5px 10px 3px 0} .pill{display:inline-block;padding:5px 10px;border-radius:20px;background:#354861;font-size:12px}
     .sub{font-size:13px;color:#b4c1d3}"""
-    return HTMLResponse(f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Greekgodx Highlights</title><style>{style}</style></head><body><h1>Greekgodx Highlights</h1><p>Private Twitch discovery and review dashboard · <a href="https://www.twitch.tv/greekgodx/clips">Original Twitch clips</a></p>{content}<small>This service does not automatically download, edit or publish videos. Creator and third-party rights must be verified before republishing.</small></body></html>')
+    return HTMLResponse(f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Greekgodx Highlights</title><style>{style}</style></head><body><h1>Greekgodx Highlights</h1><p>Private Twitch discovery and automatic shortlist dashboard · <a href="https://www.twitch.tv/greekgodx/clips">Original Twitch clips</a></p>{content}<small>This service does not automatically download, edit or publish videos. Creator and third-party rights must be verified before republishing.</small></body></html>')
 
 @app.get("/health", response_class=PlainTextResponse)
 def health():
@@ -244,28 +245,25 @@ def diagnostics(user=Depends(auth)):
 def index(user=Depends(auth)):
     try:
         rights()
-        permitted = "Creator permission recorded in configuration."
+        permitted = "Creator permission recorded for external publishing."
     except ValueError as err:
-        permitted = str(err)
+        permitted = "Publishing documentation: " + str(err) + " Discovery and shortlisting remain available."
     ready = bool(os.environ.get("TWITCH_CLIENT_ID") and os.environ.get("TWITCH_CLIENT_SECRET"))
     notice = f"<article><b>Scanner:</b> {'enabled' if os.environ.get('SCAN_ENABLED') == '1' else 'disabled'} · Twitch credentials: {'configured' if ready else 'missing'}<p>{esc(SCAN['last_run'])} · {esc(SCAN['message'])}</p><p>{esc(permitted)}</p>"
     notice += '<p><a href="/diagnostics">Check connection diagnostics</a></p>'
     notice += f'<form action="/scan" method="post"><input type="hidden" name="token" value="{csrf("scan")}"><button>Scan Twitch now</button></form></article>'
     with LOCK, db_connect() as db:
-        clips = db.execute("SELECT * FROM clips ORDER BY CASE status WHEN 'new' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, score DESC,views DESC LIMIT 100").fetchall()
+        clips = db.execute("SELECT * FROM clips ORDER BY CASE status WHEN 'ready' THEN 0 ELSE 1 END, score DESC,views DESC LIMIT 100").fetchall()
         posts = {(p["clip_id"], p["platform"]) for p in db.execute("SELECT clip_id,platform FROM posts")}
     blocks = ""
     for c in clips:
         cid = str(c["id"])
-        token = csrf("review", cid)
         actions = ""
-        if c["status"] == "new":
-            actions = (f'<form method="post" action="/review/{quote(cid,safe="")}"><input type="hidden" name="token" value="{token}">'
-                '<input type="hidden" name="decision" value="approved"><label><input type="checkbox" required name="checked" value="yes"> Rights and content checked</label> <button>Approve</button></form>'
-                f'<form method="post" action="/review/{quote(cid,safe="")}"><input type="hidden" name="token" value="{token}">'
-                '<input type="hidden" name="decision" value="rejected"><button>Reject</button></form>')
-        elif c["status"] == "approved":
-            actions = "<p>Approved for manual review/editing. Downloading and publishing integrations are not connected.</p>"
+        if c["status"] == "ready":
+            actions = "<p>Automatically shortlisted. Editing and posting integrations are not yet connected.</p>"
+            actions += (f'<form method="post" action="/dismiss/{quote(cid,safe="")}">'
+                f'<input type="hidden" name="token" value="{csrf("dismiss",cid)}">'
+                '<button>Dismiss clip</button></form>')
             for platform in ("youtube", "tiktok"):
                 if (cid, platform) not in posts:
                     actions += (f'<form method="post" action="/record/{quote(cid,safe="")}/{platform}">'
@@ -283,23 +281,14 @@ def manual_scan(token: str=Form(""),user=Depends(auth)):
     threading.Thread(target=do_scan, daemon=True).start()
     return RedirectResponse("/", status_code=303)
 
-@app.post("/review/{clip_id}")
-def review(clip_id: str, token: str=Form(""),decision: str=Form(""),checked: str=Form(""),user=Depends(auth)):
-    verify_token("review", clip_id, token)
-    if decision not in ("approved", "rejected"):
-        raise HTTPException(400, "Invalid decision")
-    if decision == "approved":
-        try:
-            rights()
-        except ValueError as err:
-            raise HTTPException(403, str(err))
-        if checked != "yes":
-            raise HTTPException(400, "Review confirmation required")
+@app.post("/dismiss/{clip_id}")
+def dismiss(clip_id: str, token: str=Form(""), user=Depends(auth)):
+    verify_token("dismiss", clip_id, token)
     with LOCK, db_connect() as db:
         row = db.execute("SELECT status FROM clips WHERE id=?", (clip_id,)).fetchone()
-        if not row or row["status"] != "new":
-            raise HTTPException(404, "Unreviewed clip not found")
-        db.execute("UPDATE clips SET status=? WHERE id=?", (decision, clip_id))
+        if not row or row["status"] != "ready":
+            raise HTTPException(404, "Shortlisted clip not found")
+        db.execute("UPDATE clips SET status='rejected' WHERE id=?", (clip_id,))
         db.commit()
     return RedirectResponse("/", status_code=303)
 
@@ -319,8 +308,8 @@ def record(clip_id: str, platform: str, token: str=Form(""),url: str=Form(""), u
         raise HTTPException(400, "Use a valid platform HTTPS URL")
     with LOCK, db_connect() as db:
         row = db.execute("SELECT status FROM clips WHERE id=?", (clip_id,)).fetchone()
-        if not row or row["status"] != "approved":
-            raise HTTPException(404, "Approved clip not found")
+        if not row or row["status"] != "ready":
+            raise HTTPException(404, "Shortlisted clip not found")
         db.execute("INSERT OR REPLACE INTO posts(clip_id,platform,url) VALUES(?,?,?)", (clip_id,platform,url))
         db.commit()
     return RedirectResponse("/", status_code=303)
