@@ -99,7 +99,7 @@ def twitch_clips():
     with httpx.Client(timeout=30) as client:
         token_response = client.post(
             "https://id.twitch.tv/oauth2/token",
-            params={"client_id": client_id, "client_secret": client_secret, "grant_type": "client_credentials"})
+            data={"client_id": client_id, "client_secret": client_secret, "grant_type": "client_credentials"})
         token_response.raise_for_status()
         token = token_response.json()["access_token"]
         headers = {"Client-Id": client_id, "Authorization": f"Bearer {token}"}
@@ -190,6 +190,10 @@ async def lifespan(app):
     if not os.environ.get("DASHBOARD_USERNAME") or len(os.environ.get("DASHBOARD_PASSWORD", "")) < 16:
         raise RuntimeError("Set DASHBOARD_USERNAME and a 16+ character DASHBOARD_PASSWORD")
     init_db()
+    logger.info("GGX startup: twitch_client_id=%s twitch_client_secret=%s scanning=%s",
+                bool(os.environ.get("TWITCH_CLIENT_ID", "").strip()),
+                bool(os.environ.get("TWITCH_CLIENT_SECRET", "").strip()),
+                os.environ.get("SCAN_ENABLED") == "1")
     STOP.clear()
     worker = threading.Thread(target=schedule_scans, daemon=True)
     worker.start()
@@ -222,6 +226,20 @@ def page(content):
 def health():
     return "ok"
 
+@app.get("/diagnostics", response_class=HTMLResponse)
+def diagnostics(user=Depends(auth)):
+    """Authenticated configuration overview; never returns secret values."""
+    names = ("TWITCH_CLIENT_ID", "TWITCH_CLIENT_SECRET", "SCAN_ENABLED")
+    checks = []
+    for key in names:
+        found = os.environ.get(key, "").strip()
+        ready = bool(found) if key != "SCAN_ENABLED" else found == "1"
+        checks.append(f'<li><b>{key}</b>: {"configured" if ready else "not configured"}</li>')
+    detail = "<article><h2>Connection diagnostics</h2><ul>" + "".join(checks) + "</ul>"
+    detail += f'<p>Last scan: {esc(SCAN["last_run"])} · {esc(SCAN["message"])}</p>'
+    detail += '<p>Secrets are never shown here. Add missing settings in your Render Environment page, save and redeploy.</p></article>'
+    return page(detail + '<p><a href="/">Back to dashboard</a></p>')
+
 @app.get("/", response_class=HTMLResponse)
 def index(user=Depends(auth)):
     try:
@@ -231,6 +249,7 @@ def index(user=Depends(auth)):
         permitted = str(err)
     ready = bool(os.environ.get("TWITCH_CLIENT_ID") and os.environ.get("TWITCH_CLIENT_SECRET"))
     notice = f"<article><b>Scanner:</b> {'enabled' if os.environ.get('SCAN_ENABLED') == '1' else 'disabled'} · Twitch credentials: {'configured' if ready else 'missing'}<p>{esc(SCAN['last_run'])} · {esc(SCAN['message'])}</p><p>{esc(permitted)}</p>"
+    notice += '<p><a href="/diagnostics">Check connection diagnostics</a></p>'
     notice += f'<form action="/scan" method="post"><input type="hidden" name="token" value="{csrf("scan")}"><button>Scan Twitch now</button></form></article>'
     with LOCK, db_connect() as db:
         clips = db.execute("SELECT * FROM clips ORDER BY CASE status WHEN 'new' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END, score DESC,views DESC LIMIT 100").fetchall()
