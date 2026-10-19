@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+*.db
+*.sqlite3
+media/
+output/
+*.mp4
+*.mov
+*.mkv
